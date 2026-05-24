@@ -567,6 +567,18 @@ app.post('/api/auth/reset-password', async (req, res) => {
   }
 });
 
+// ==================== ROUTE LOGOUT ====================
+app.post('/api/auth/logout', requireAuth, async (req, res) => {
+  try {
+    await PushToken.updateMany({ userId: req.user.id }, { isActive: false });
+    console.log('✅ Déconnexion:', req.user.email);
+    res.json({ success: true, message: 'Déconnexion réussie' });
+  } catch (error) {
+    console.error('❌ Erreur logout:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 // ==================== ROUTES PUSH TOKENS ====================
 
 app.post('/api/users/push-token', requireAuth, async (req, res) => {
