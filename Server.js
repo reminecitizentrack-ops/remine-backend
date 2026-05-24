@@ -31,22 +31,6 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,h
   .split(',')
   .map(o => o.trim());
 
-// Fonction CORS dynamique — accepte localhost, origines configurées, et toutes les URLs ngrok
-const corsOriginFn = (origin, callback) => {
-  if (
-    !origin ||
-    ALLOWED_ORIGINS.includes(origin) ||
-    origin.endsWith('.ngrok-free.app') ||
-    origin.endsWith('.ngrok-free.dev') ||
-    origin.endsWith('.ngrok.io')
-  ) {
-    callback(null, true);
-  } else {
-    console.warn('🚫 CORS bloqué pour:', origin);
-    callback(new Error('Not allowed by CORS'));
-  }
-};
-
 // ==================== SERVEUR ====================
 
 const app        = express();
@@ -54,7 +38,7 @@ const httpServer = createServer(app);
 
 // Socket.io pour les clients web
 const io = new Server(httpServer, {
-  cors: { origin: corsOriginFn, methods: ['GET', 'POST', 'PUT'], credentials: true }
+  cors: { origin: ALLOWED_ORIGINS, methods: ['GET', 'POST', 'PUT'], credentials: true }
 });
 global.io = io;
 
@@ -107,7 +91,7 @@ global.broadcastMobile = (event, data) => {
 };
 
 // Middleware
-app.use(cors({ origin: corsOriginFn, credentials: true }));
+app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -1390,6 +1374,183 @@ app.delete('/api/valorization/projects/:id', requireAuth, requireAdmin, async (r
   }
 });
 
+
+
+// ==================== ROUTE TAGS SUR SIGNALEMENTS ====================
+
+app.put('/api/admin/reports/:id/tags', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { tags } = req.body;
+    if (!Array.isArray(tags)) return res.status(400).json({ success: false, error: 'tags doit être un tableau' });
+    const report = await Report.findByIdAndUpdate(
+      req.params.id,
+      { tags: tags.map(t => String(t).trim().toLowerCase()).filter(Boolean) },
+      { new: true }
+    );
+    if (!report) return res.status(404).json({ success: false, error: 'Signalement non trouvé' });
+    res.json({ success: true, data: { tags: report.tags } });
+  } catch (error) {
+    console.error('❌ Erreur tags:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.get('/api/admin/tags', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    // Agréger tous les tags distincts utilisés dans les signalements
+    const result = await Report.aggregate([
+      { $unwind: { path: '$tags', preserveNullAndEmptyArrays: false } },
+      { $group: { _id: '$tags', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 100 },
+    ]);
+    const tags = result.map(r => ({ name: r._id, count: r.count }));
+    res.json({ success: true, data: tags });
+  } catch (error) {
+    console.error('❌ Erreur get tags:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ==================== ROUTE JOURNAL DES ACTIONS ====================
+
+// Modèle léger pour les actions admin (in-memory si pas persisté)
+const actionLogSchema = new mongoose.Schema({
+  action:    { type: String, required: true },
+  adminId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  adminEmail:{ type: String },
+  targetId:  { type: String },
+  targetType:{ type: String },
+  details:   { type: Object },
+  createdAt: { type: Date, default: Date.now, index: true },
+}, { timestamps: false });
+actionLogSchema.index({ createdAt: -1 });
+const ActionLog = mongoose.models.ActionLog || mongoose.model('ActionLog', actionLogSchema);
+global.ActionLog = ActionLog;
+
+// Middleware pour logger les actions importantes (appelé depuis les routes)
+global.logAction = async (action, req, details = {}) => {
+  try {
+    await ActionLog.create({
+      action,
+      adminId:    req.user?.id,
+      adminEmail: req.user?.email,
+      targetId:   details.targetId,
+      targetType: details.targetType,
+      details,
+    });
+  } catch (e) { /* non bloquant */ }
+};
+
+app.get('/api/admin/action-logs', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 50, action } = req.query;
+    const filter = {};
+    if (action && action !== 'all') filter.action = action;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const [logs, total] = await Promise.all([
+      ActionLog.find(filter).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit)).lean(),
+      ActionLog.countDocuments(filter),
+    ]);
+    res.json({ success: true, data: { logs, total, page: parseInt(page), totalPages: Math.ceil(total / parseInt(limit)) } });
+  } catch (error) {
+    console.error('❌ Erreur action-logs:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ==================== ROUTES MESSAGERIE ADMIN → CITOYEN ====================
+
+const messageSchema = new mongoose.Schema({
+  fromAdmin:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  toUser:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  subject:     { type: String, required: true },
+  content:     { type: String, required: true },
+  reportId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Report' },
+  isRead:      { type: Boolean, default: false },
+  readAt:      { type: Date },
+}, { timestamps: true });
+messageSchema.index({ toUser: 1, createdAt: -1 });
+messageSchema.index({ fromAdmin: 1, createdAt: -1 });
+const Message = mongoose.models.Message || mongoose.model('Message', messageSchema);
+
+app.post('/api/messages', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { toUserId, subject, content, reportId } = req.body;
+    if (!toUserId || !subject?.trim() || !content?.trim()) {
+      return res.status(400).json({ success: false, error: 'Destinataire, sujet et contenu requis' });
+    }
+    const recipient = await User.findById(toUserId);
+    if (!recipient) return res.status(404).json({ success: false, error: 'Utilisateur non trouvé' });
+
+    const message = await Message.create({
+      fromAdmin: req.user.id,
+      toUser: toUserId,
+      subject: subject.trim(),
+      content: content.trim(),
+      reportId: reportId || undefined,
+    });
+
+    // Notifier via WebSocket mobile
+    if (global.notifyUser) {
+      global.notifyUser(toUserId, 'new_message', {
+        subject: subject.trim(),
+        from: `${req.user.firstName || ''} ${req.user.lastName || ''}`.trim() || 'Admin',
+        messageId: message._id,
+      });
+    }
+
+    if (global.emitSSE) global.emitSSE('new-message', { messageId: message._id });
+
+    console.log(`✉️ Message envoyé à ${recipient.email} par ${req.user.email}`);
+    res.status(201).json({ success: true, data: message });
+  } catch (error) {
+    console.error('❌ Erreur message POST:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.get('/api/messages/sent', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 30 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const [messages, total] = await Promise.all([
+      Message.find({ fromAdmin: req.user.id })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .populate('toUser', 'firstName lastName email community')
+        .populate('reportId', 'type location')
+        .lean(),
+      Message.countDocuments({ fromAdmin: req.user.id }),
+    ]);
+    res.json({ success: true, data: { messages, total } });
+  } catch (error) {
+    console.error('❌ Erreur messages GET:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+app.get('/api/messages/all', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 30 } = req.query;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const [messages, total] = await Promise.all([
+      Message.find({})
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(parseInt(limit))
+        .populate('toUser',    'firstName lastName email community')
+        .populate('fromAdmin', 'firstName lastName email')
+        .populate('reportId',  'type location')
+        .lean(),
+      Message.countDocuments({}),
+    ]);
+    res.json({ success: true, data: { messages, total } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
 
 // ==================== ROUTE FILTER OPTIONS ====================
 
