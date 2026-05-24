@@ -9,6 +9,9 @@ import { Server } from 'socket.io';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 
+import { Resend } from 'resend';
+const resend = new Resend(process.env.RESEND_API_KEY);
+
 // ==================== CONFIGURATION ====================
 
 const PORT        = process.env.PORT        || 5001;
@@ -553,14 +556,49 @@ app.post('/api/auth/reset-password', async (req, res) => {
     if (!email) {
       return res.status(400).json({ success: false, error: 'Email requis' });
     }
+
     const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user) {
       return res.json({ success: true, message: 'Si cet email existe, un lien vous sera envoyé.' });
     }
+
     const crypto = await import('crypto');
     const resetToken = crypto.default.randomBytes(32).toString('hex');
-    console.log(`🔐 Reset token pour ${email}: ${resetToken}`);
+    const resetExpires = new Date(Date.now() + 3600000);
+
+    user.resetPasswordToken = resetToken;
+    user.resetPasswordExpires = resetExpires;
+    await user.save();
+
+    const resetUrl = `https://remine-dashboard.vercel.app/reset-password?token=${resetToken}&email=${encodeURIComponent(email)}`;
+
+    await resend.emails.send({
+      from: 'ReMine <onboarding@resend.dev>',
+      to: email,
+      subject: '🔐 Réinitialisation de votre mot de passe ReMine',
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+          <div style="background: #16a34a; padding: 20px; border-radius: 12px 12px 0 0; text-align: center;">
+            <h1 style="color: white; margin: 0;">🌍 ReMine Citizen Track</h1>
+          </div>
+          <div style="background: #f9fafb; padding: 30px; border-radius: 0 0 12px 12px; border: 1px solid #e5e7eb;">
+            <h2 style="color: #111827;">Réinitialisation de mot de passe</h2>
+            <p style="color: #6b7280;">Bonjour ${user.firstName || ''},</p>
+            <p style="color: #6b7280;">Vous avez demandé à réinitialiser votre mot de passe. Cliquez sur le bouton ci-dessous :</p>
+            <div style="text-align: center; margin: 30px 0;">
+              <a href="${resetUrl}" style="background: #16a34a; color: white; padding: 14px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 16px;">
+                Réinitialiser mon mot de passe
+              </a>
+            </div>
+            <p style="color: #9ca3af; font-size: 13px;">Ce lien expire dans 1 heure. Si vous n\'avez pas fait cette demande, ignorez cet email.</p>
+          </div>
+        </div>
+      `
+    });
+
+    console.log('✅ Email de réinitialisation envoyé à', email);
     res.json({ success: true, message: 'Un lien de réinitialisation a été envoyé à votre adresse email.' });
+
   } catch (error) {
     console.error('❌ Erreur reset-password:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur' });
