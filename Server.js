@@ -38,7 +38,8 @@ const corsOriginFn = (origin, callback) => {
     ALLOWED_ORIGINS.includes(origin) ||
     origin.endsWith('.ngrok-free.app') ||
     origin.endsWith('.ngrok-free.dev') ||
-    origin.endsWith('.ngrok.io')
+    origin.endsWith('.ngrok.io') ||
+    origin.endsWith('.vercel.app')
   ) {
     callback(null, true);
   } else {
