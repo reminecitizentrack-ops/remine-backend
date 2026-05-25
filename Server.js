@@ -617,6 +617,23 @@ app.post('/api/auth/logout', requireAuth, async (req, res) => {
   }
 });
 
+// ==================== ROUTE STATS PUBLIQUES ====================
+app.get('/api/public/stats', async (req, res) => {
+  try {
+    const [totalReports, totalUsers, resolvedReports, locations] = await Promise.all([
+      Report.countDocuments(),
+      User.countDocuments({ role: 'citizen' }),
+      Report.countDocuments({ status: 'resolved' }),
+      Report.distinct('location.city'),
+    ]);
+    const resolutionRate = totalReports > 0 ? Math.round((resolvedReports / totalReports) * 100) : 0;
+    const topLocation = locations.filter(Boolean)[0] || 'Sénégal';
+    res.json({ success: true, data: { totalReports, totalUsers, resolvedReports, resolutionRate, topLocation } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 // ==================== ROUTES PUSH TOKENS ====================
 
 app.post('/api/users/push-token', requireAuth, async (req, res) => {
