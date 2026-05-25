@@ -9,14 +9,8 @@ import { Server } from 'socket.io';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
 
-import nodemailer from 'nodemailer';
-const transporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD,
-  },
-});
+import { Resend } from 'resend';
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 // ==================== CONFIGURATION ====================
 
@@ -578,8 +572,8 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
     const resetUrl = `https://remine-dashboard.vercel.app/reset-password?token=${resetToken}&email=${encodeURIComponent(email)}`;
 
-    await transporter.sendMail({
-      from: `"ReMine Citizen Track" <${process.env.GMAIL_USER}>`,
+    await resend.emails.send({
+      from: 'ReMine <onboarding@resend.dev>',
       to: email,
       subject: '🔐 Réinitialisation de votre mot de passe ReMine',
       html: `
@@ -596,10 +590,10 @@ app.post('/api/auth/reset-password', async (req, res) => {
                 Réinitialiser mon mot de passe
               </a>
             </div>
-            <p style="color: #9ca3af; font-size: 13px;">Ce lien expire dans 1 heure. Si vous n'avez pas fait cette demande, ignorez cet email.</p>
+            <p style="color: #9ca3af; font-size: 13px;">Ce lien expire dans 1 heure. Si vous n\'avez pas fait cette demande, ignorez cet email.</p>
           </div>
         </div>
-      `,
+      `
     });
 
     console.log('✅ Email de réinitialisation envoyé à', email);
