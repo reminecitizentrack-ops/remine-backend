@@ -8,6 +8,9 @@ import jwt from 'jsonwebtoken';
 import { Server } from 'socket.io';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
+import helmet from 'helmet';
+import compression from 'compression';
+import rateLimit from 'express-rate-limit';
 
 import { Resend } from 'resend';
 const resend = new Resend(process.env.RESEND_API_KEY);
@@ -55,6 +58,42 @@ const corsOriginFn = (origin, callback) => {
 
 const app        = express();
 const httpServer = createServer(app);
+
+// ── Trust proxy (Render, Railway, Heroku, etc.) ──
+app.set('trust proxy', 1);
+
+// ── Helmet — en-têtes de sécurité HTTP ──
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  contentSecurityPolicy: false, // désactivé car l'API est consommée par des clients tiers
+}));
+
+// ── Compression gzip ──
+app.use(compression());
+
+// ── Rate limiters ──
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,   // 15 minutes
+  max: 10,                     // 10 tentatives par IP
+  message: { success: false, error: 'Trop de tentatives, réessayez dans 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,    // 1 minute
+  max: 120,                    // 120 requêtes par minute par IP
+  message: { success: false, error: 'Trop de requêtes, ralentissez.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const uploadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,   // 1 heure
+  max: 20,                     // 20 uploads max par heure
+  message: { success: false, error: 'Quota d\'upload atteint, réessayez dans une heure.' },
+});
 
 // Socket.io pour les clients web
 const io = new Server(httpServer, {
@@ -112,8 +151,9 @@ global.broadcastMobile = (event, data) => {
 
 // Middleware
 app.use(cors({ origin: corsOriginFn, credentials: true }));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use('/api/', apiLimiter);
+app.use(express.json({ limit: '5mb' }));
+app.use(express.urlencoded({ extended: true, limit: '5mb' }));
 
 // Logging minimal
 app.use((req, _res, next) => {
@@ -122,6 +162,32 @@ app.use((req, _res, next) => {
   }
   next();
 });
+
+// ==================== CACHE MÉMOIRE SIMPLE ====================
+// Cache LRU léger pour les endpoints fréquents (stats, analytics)
+const cache = new Map();
+const CACHE_TTL = {
+  stats:    60 * 1000,   // 1 minute
+  analytics: 2 * 60 * 1000, // 2 minutes
+  regions:   2 * 60 * 1000,
+};
+
+function getCache(key) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { cache.delete(key); return null; }
+  return entry.data;
+}
+function setCache(key, data, ttl = 60000) {
+  if (cache.size > 50) {
+    // Purger les entrées expirées si trop de clés
+    for (const [k, v] of cache) { if (Date.now() > v.expiresAt) cache.delete(k); }
+  }
+  cache.set(key, { data, expiresAt: Date.now() + ttl });
+}
+function invalidateCache(prefix) {
+  for (const key of cache.keys()) { if (key.startsWith(prefix)) cache.delete(key); }
+}
 
 // ==================== CONNEXION MONGODB ====================
 
@@ -444,7 +510,7 @@ app.get('/api/health', (_req, res) => {
 
 // ==================== ROUTES AUTH ====================
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', authLimiter, async (req, res) => {
   try {
     const { email, firstName, lastName, password, role, community, phone } = req.body;
 
@@ -486,7 +552,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
@@ -550,7 +616,7 @@ app.put('/api/auth/change-password', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/auth/reset-password', async (req, res) => {
+app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) {
@@ -804,7 +870,7 @@ app.post('/api/notifications/broadcast', requireAuth, requireAdmin, async (req, 
 
 // ==================== ROUTES SIGNALEMENTS ====================
 
-app.post('/api/reports', requireAuth, async (req, res) => {
+app.post('/api/reports', requireAuth, uploadLimiter, async (req, res) => {
   try {
     const { type, description, location, severity = 'medium', images = [], metadata = {}, title = '' } = req.body;
     const citizenId = req.user.id;
@@ -860,6 +926,7 @@ app.post('/api/reports', requireAuth, async (req, res) => {
       if (global.emitSSE) global.emitSSE('new-report', { type: 'NEW_REPORT', reportId: report._id, reportType: report.type, severity: report.severity });
     }
 
+    invalidateCache('stats:');
     console.log('✅ Signalement créé:', report._id, 'par', req.user.email);
     res.status(201).json({
       success: true,
@@ -901,9 +968,12 @@ app.get('/api/reports/mine', requireAuth, async (req, res) => {
   }
 });
 
-app.get('/api/reports', async (req, res) => {
+app.get('/api/reports', requireAuth, async (req, res) => {
   try {
-    const { limit = 20, page = 1, status, type, severity } = req.query;
+    const rawLimit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const rawPage  = Math.max(1, parseInt(req.query.page) || 1);
+    const { status, type, severity } = req.query;
+    const limit = rawLimit, page = rawPage;
     const filter = {};
     if (status   && status   !== 'all') filter.status   = status;
     if (type     && type     !== 'all') filter.type     = type;
@@ -1083,10 +1153,12 @@ app.get('/api/admin/reports', requireAuth, requireAdmin, async (req, res) => {
     if (type     && type     !== 'all') filter.type     = type;
     if (severity && severity !== 'all') filter.severity = severity;
     if (search?.trim()) {
+      // Échapper les caractères spéciaux regex pour prévenir les ReDoS
+      const safeSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').substring(0, 100);
       filter.$or = [
-        { description:        { $regex: search, $options: 'i' } },
-        { 'location.address': { $regex: search, $options: 'i' } },
-        { title:              { $regex: search, $options: 'i' } },
+        { description:        { $regex: safeSearch, $options: 'i' } },
+        { 'location.address': { $regex: safeSearch, $options: 'i' } },
+        { title:              { $regex: safeSearch, $options: 'i' } },
       ];
     }
 
@@ -1164,6 +1236,7 @@ app.put('/api/admin/reports/:id/status', requireAuth, requireAdmin, async (req, 
     if (wasVerified)          notify('report_verified', base);
     if (wasResolved)          notify('report_resolved', { ...base, resolvedAt: report.resolvedAt });
 
+    invalidateCache('stats:');
     console.log('Statut mis à jour:', report._id, '->', status, 'par', req.user.email);
     res.json({ success: true, message: 'Statut mis à jour', data: { report } });
 
@@ -1175,6 +1248,9 @@ app.put('/api/admin/reports/:id/status', requireAuth, requireAdmin, async (req, 
 
 app.get('/api/admin/stats', requireAuth, requireAdmin, async (req, res) => {
   try {
+    const cached = getCache('stats:admin');
+    if (cached) return res.json(cached);
+
     const [reportStats, totalUsers, activeUsers, recentReports, reportsByType, reportsByStatus, topCitizens] =
       await Promise.all([
         Report.getStats(),
@@ -1202,7 +1278,7 @@ app.get('/api/admin/stats', requireAuth, requireAdmin, async (req, res) => {
     const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const reportsLast7Days = await Report.countDocuments({ createdAt: { $gte: sevenDaysAgo } });
 
-    res.json({
+    const result = {
       success: true,
       data: {
         overview: {
@@ -1219,7 +1295,9 @@ app.get('/api/admin/stats', requireAuth, requireAdmin, async (req, res) => {
         topCitizens,
         recentActivity: { reportsLast7Days },
       },
-    });
+    };
+    setCache('stats:admin', result, CACHE_TTL.stats);
+    res.json(result);
 
   } catch (error) {
     console.error('❌ Erreur statistiques:', error);
@@ -1572,10 +1650,12 @@ app.get('/api/admin/export', requireAuth, requireAdmin, async (req, res) => {
     if (type     && type     !== 'all') filter.type     = type;
     if (severity && severity !== 'all') filter.severity = severity;
     if (search?.trim()) {
+      // Échapper les caractères spéciaux regex pour prévenir les ReDoS
+      const safeSearch = search.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').substring(0, 100);
       filter.$or = [
-        { description:        { $regex: search, $options: 'i' } },
-        { 'location.address': { $regex: search, $options: 'i' } },
-        { title:              { $regex: search, $options: 'i' } },
+        { description:        { $regex: safeSearch, $options: 'i' } },
+        { 'location.address': { $regex: safeSearch, $options: 'i' } },
+        { title:              { $regex: safeSearch, $options: 'i' } },
       ];
     }
 
@@ -1767,21 +1847,43 @@ app.post('/api/admin/demo-data', requireAuth, requireAdmin, async (req, res) => 
 
 app.get('/api/admin/activity', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const days = 7;
+    const { days: daysParam = '7' } = req.query;
+    const days = Math.min(90, Math.max(1, parseInt(daysParam) || 7));
+    const since = new Date();
+    since.setDate(since.getDate() - (days - 1));
+    since.setHours(0, 0, 0, 0);
+
+    // Une seule agrégation au lieu de N requêtes séquentielles
+    const raw = await Report.aggregate([
+      { $match: { createdAt: { $gte: since } } },
+      { $group: {
+          _id: {
+            year:  { $year:  '$createdAt' },
+            month: { $month: '$createdAt' },
+            day:   { $dayOfMonth: '$createdAt' },
+          },
+          count: { $sum: 1 },
+        },
+      },
+      { $sort: { '_id.year': 1, '_id.month': 1, '_id.day': 1 } },
+    ]);
+
+    // Reconstruire un tableau complet (jours sans signalement = 0)
+    const map = new Map(raw.map(r => {
+      const d = new Date(r._id.year, r._id.month - 1, r._id.day);
+      return [d.toISOString().split('T')[0], r.count];
+    }));
+
     const results = [];
-
     for (let i = days - 1; i >= 0; i--) {
-      const start = new Date();
-      start.setDate(start.getDate() - i);
-      start.setHours(0, 0, 0, 0);
-      const end = new Date(start);
-      end.setHours(23, 59, 59, 999);
-
-      const count = await Report.countDocuments({ createdAt: { $gte: start, $lte: end } });
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      d.setHours(0, 0, 0, 0);
+      const key = d.toISOString().split('T')[0];
       results.push({
-        date:  start.toISOString().split('T')[0],
-        label: start.toLocaleDateString('fr-FR', { weekday: 'short', day: 'numeric' }),
-        count,
+        date:  key,
+        label: d.toLocaleDateString('fr-FR', { weekday: 'short', day: 'numeric' }),
+        count: map.get(key) || 0,
       });
     }
 
@@ -2050,6 +2152,310 @@ function emitSSE(event, data) {
 
 // Exposer globalement pour réutilisation dans les routes
 global.emitSSE = emitSSE;
+
+
+
+// ==================== NOUVEAUX ENDPOINTS ====================
+
+// ── GET /api/admin/regions — stats par région (pour l\'onglet Régions dashboard) ──
+app.get('/api/admin/regions', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const cached = getCache('stats:regions');
+    if (cached) return res.json(cached);
+
+    const [byRegion, byCity] = await Promise.all([
+      Report.aggregate([
+        { $match: { 'location.region': { $exists: true, $ne: '' } } },
+        { $group: {
+            _id:           '$location.region',
+            total:         { $sum: 1 },
+            resolved:      { $sum: { $cond: [{ $eq: ['$status', 'resolved'] }, 1, 0] } },
+            critical:      { $sum: { $cond: [{ $eq: ['$severity', 'critical'] }, 1, 0] } },
+            high:          { $sum: { $cond: [{ $eq: ['$severity', 'high'] }, 1, 0] } },
+            avgConfidence: { $avg: '$confidenceScore' },
+            lastReport:    { $max: '$createdAt' },
+            types:         { $push: '$type' },
+          },
+        },
+        { $project: {
+            _id: 0,
+            region:         '$_id',
+            total:          1,
+            resolved:       1,
+            critical:       1,
+            high:           1,
+            avgConfidence:  { $round: ['$avgConfidence', 1] },
+            lastReport:     1,
+            resolutionRate: {
+              $cond: [
+                { $eq: ['$total', 0] }, 0,
+                { $multiply: [{ $divide: ['$resolved', '$total'] }, 100] },
+              ],
+            },
+          },
+        },
+        { $sort: { total: -1 } },
+      ]),
+      Report.aggregate([
+        { $match: { 'location.city': { $exists: true, $ne: '' } } },
+        { $group: {
+            _id:   '$location.city',
+            total: { $sum: 1 },
+            lat:   { $avg: '$location.latitude' },
+            lng:   { $avg: '$location.longitude' },
+          },
+        },
+        { $sort: { total: -1 } },
+        { $limit: 20 },
+        { $project: { _id: 0, city: '$_id', total: 1, lat: 1, lng: 1 } },
+      ]),
+    ]);
+
+    const result = { success: true, data: { byRegion, byCity } };
+    setCache('stats:regions', result, CACHE_TTL.regions);
+    res.json(result);
+  } catch (error) {
+    console.error('❌ Erreur régions:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── GET /api/admin/export/csv — export CSV des signalements ──
+app.get('/api/admin/export/csv', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { status, type, severity, dateFrom, dateTo } = req.query;
+    const filter = {};
+    if (status   && status   !== 'all') filter.status   = status;
+    if (type     && type     !== 'all') filter.type     = type;
+    if (severity && severity !== 'all') filter.severity = severity;
+    if (dateFrom || dateTo) {
+      filter.createdAt = {};
+      if (dateFrom) filter.createdAt.$gte = new Date(dateFrom);
+      if (dateTo)   filter.createdAt.$lte = new Date(new Date(dateTo).setHours(23, 59, 59, 999));
+    }
+
+    const reports = await Report.find(filter)
+      .populate('citizen', 'firstName lastName email community')
+      .sort({ createdAt: -1 })
+      .limit(5000)
+      .lean();
+
+    // Générer le CSV
+    const headers = [
+      'ID', 'Type', 'Titre', 'Description', 'Statut', 'Sévérité',
+      'Adresse', 'Ville', 'Région', 'Latitude', 'Longitude',
+      'Citoyen', 'Email citoyen', 'Communauté',
+      'Score confiance', 'Votes', 'Vérifié',
+      'Créé le', 'Résolu le',
+    ];
+
+    const escape = (v) => {
+      if (v == null) return '';
+      const s = String(v).replace(/"/g, '""');
+      return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s}"` : s;
+    };
+
+    const rows = reports.map(r => [
+      r._id,
+      r.type,
+      r.title || '',
+      (r.description || '').substring(0, 200),
+      r.status,
+      r.severity,
+      r.location?.address || '',
+      r.location?.city    || '',
+      r.location?.region  || '',
+      r.location?.latitude  ?? '',
+      r.location?.longitude ?? '',
+      r.citizen ? `${r.citizen.firstName || ''} ${r.citizen.lastName || ''}`.trim() : '',
+      r.citizen?.email    || '',
+      r.citizen?.community || '',
+      r.confidenceScore   ?? '',
+      r.voteCount         ?? 0,
+      r.isVerified ? 'Oui' : 'Non',
+      r.createdAt ? new Date(r.createdAt).toLocaleDateString('fr-FR') : '',
+      r.resolvedAt ? new Date(r.resolvedAt).toLocaleDateString('fr-FR') : '',
+    ].map(escape).join(','));
+
+    const csv = '\uFEFF' + [headers.join(','), ...rows].join('\n'); // BOM pour Excel
+
+    const filename = `remine_signalements_${new Date().toISOString().split('T')[0]}.csv`;
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+
+    console.log(`📤 Export CSV: ${reports.length} signalements par ${req.user.email}`);
+  } catch (error) {
+    console.error('❌ Erreur export CSV:', error);
+    res.status(500).json({ success: false, error: 'Erreur export' });
+  }
+});
+
+// ── PATCH /api/reports/:id — mise à jour partielle par le citoyen ──
+app.patch('/api/reports/:id', requireAuth, async (req, res) => {
+  try {
+    const report = await Report.findById(req.params.id);
+    if (!report) return res.status(404).json({ success: false, error: 'Signalement non trouvé' });
+
+    // Seul le citoyen propriétaire peut modifier, et seulement si statut = new
+    const isOwner = String(report.citizen) === String(req.user.id);
+    const isAdmin = ['admin', 'moderator'].includes(req.user.role);
+    if (!isOwner && !isAdmin) {
+      return res.status(403).json({ success: false, error: 'Non autorisé' });
+    }
+    if (isOwner && !isAdmin && report.status !== 'new') {
+      return res.status(400).json({ success: false, error: 'Impossible de modifier un signalement déjà traité' });
+    }
+
+    const allowed = ['title', 'description', 'severity'];
+    const updates = {};
+    for (const field of allowed) {
+      if (req.body[field] !== undefined) updates[field] = req.body[field];
+    }
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ success: false, error: 'Aucun champ modifiable fourni' });
+    }
+    if (updates.description && updates.description.length < 10) {
+      return res.status(400).json({ success: false, error: 'Description trop courte (min. 10 caractères)' });
+    }
+
+    Object.assign(report, updates);
+    await report.save();
+    await report.populate('citizen', 'firstName lastName email community');
+
+    invalidateCache('stats:');
+    if (global.io) global.io.emit('report-updated', { type: 'REPORT_UPDATED', data: report });
+
+    res.json({ success: true, message: 'Signalement mis à jour', data: { report } });
+  } catch (error) {
+    console.error('❌ Erreur PATCH report:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── GET /api/admin/search — recherche globale unifiée ──
+app.get('/api/admin/search', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { q, limit = 10 } = req.query;
+    if (!q?.trim() || q.trim().length < 2) {
+      return res.status(400).json({ success: false, error: 'Requête trop courte (min. 2 caractères)' });
+    }
+
+    const safeQ = q.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').substring(0, 80);
+    const maxResults = Math.min(20, parseInt(limit) || 10);
+    const regex = { $regex: safeQ, $options: 'i' };
+
+    const [reports, users] = await Promise.all([
+      Report.find({
+        $or: [
+          { title: regex },
+          { description: regex },
+          { 'location.address': regex },
+          { 'location.city': regex },
+        ],
+      })
+        .limit(maxResults)
+        .select('_id title type status severity location.city createdAt')
+        .lean(),
+
+      User.find({
+        $or: [{ firstName: regex }, { lastName: regex }, { email: regex }],
+      })
+        .limit(maxResults)
+        .select('_id firstName lastName email role community')
+        .lean(),
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        reports: reports.map(r => ({
+          id:       r._id,
+          label:    r.title || r.type,
+          type:     'report',
+          status:   r.status,
+          severity: r.severity,
+          city:     r.location?.city || '',
+          date:     r.createdAt,
+        })),
+        users: users.map(u => ({
+          id:    u._id,
+          label: `${u.firstName} ${u.lastName}`.trim(),
+          type:  'user',
+          email: u.email,
+          role:  u.role,
+        })),
+        total: reports.length + users.length,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Erreur search:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── GET /api/admin/dashboard — endpoint unique pour charger tout le dashboard ──
+// Remplace les 4-5 appels parallèles du dashboard par une seule requête
+app.get('/api/admin/dashboard', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const cached = getCache('stats:dashboard');
+    if (cached) return res.json(cached);
+
+    const [
+      reportStats, totalUsers, activeUsers,
+      reportsByType, reportsByStatus, topCitizens,
+      reportsLast7Days, recentReports,
+    ] = await Promise.all([
+      Report.getStats(),
+      User.countDocuments(),
+      User.countDocuments({ isActive: true }),
+      Report.aggregate([{ $group: { _id: '$type',   count: { $sum: 1 } } }]),
+      Report.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
+      Report.aggregate([
+        { $group: { _id: '$citizen', reports: { $sum: 1 } } },
+        { $sort:  { reports: -1 } },
+        { $limit: 5 },
+        { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'info' } },
+        { $project: {
+            reports: 1,
+            citizen: {
+              name:  { $concat: [{ $arrayElemAt: ['$info.firstName', 0] }, ' ', { $arrayElemAt: ['$info.lastName', 0] }] },
+              email: { $arrayElemAt: ['$info.email', 0] },
+            },
+          },
+        },
+      ]),
+      Report.countDocuments({ createdAt: { $gte: new Date(Date.now() - 7 * 86400000) } }),
+      Report.find().sort({ createdAt: -1 }).limit(10)
+        .populate('citizen', 'firstName lastName').lean(),
+    ]);
+
+    const result = {
+      success: true,
+      data: {
+        overview: {
+          totalReports:    reportStats.totalReports,
+          activeReports:   reportStats.activeReports,
+          resolvedReports: reportStats.resolvedReports,
+          resolutionRate:  Math.round(reportStats.resolutionRate),
+          totalUsers,
+          activeUsers,
+          reportsLast7Days,
+        },
+        reportsByType:   reportsByType.reduce((a, i)   => { a[i._id] = i.count; return a; }, {}),
+        reportsByStatus: reportsByStatus.reduce((a, i) => { a[i._id] = i.count; return a; }, {}),
+        topCitizens,
+        recentReports,
+      },
+    };
+
+    setCache('stats:dashboard', result, CACHE_TTL.stats);
+    res.json(result);
+  } catch (error) {
+    console.error('❌ Erreur dashboard:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
 
 // ==================== GESTION DES ERREURS ====================
 
