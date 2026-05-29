@@ -1014,6 +1014,36 @@ app.get('/api/reports/public', async (req, res) => {
   }
 });
 
+// ── GET /api/reports/top — classement par votes (dashboard admin) ──
+app.get('/api/reports/top', requireAuth, async (req, res) => {
+  try {
+    const { limit = 30, sortBy = 'voteCount', sortOrder = 'desc', status } = req.query;
+    const sort   = { [sortBy]: sortOrder === 'desc' ? -1 : 1 };
+    const filter = {};
+    if (status && status !== 'all') filter.status = status;
+
+    const reports = await Report.find(filter)
+      .sort(sort)
+      .limit(Math.min(parseInt(limit) || 30, 100))
+      .populate('citizen', 'firstName lastName email community')
+      .lean();
+
+    // Enrichir avec upvotes/downvotes calculés (sans exposer les IDs utilisateurs)
+    const enriched = reports.map(r => {
+      const votes     = r.votes || [];
+      const upvotes   = votes.filter(v => v.voteType === 'up').length;
+      const downvotes = votes.filter(v => v.voteType === 'down').length;
+      const { votes: _v, ...rest } = r;
+      return { ...rest, upvotes, downvotes };
+    });
+
+    res.json({ success: true, data: { reports: enriched, total: enriched.length } });
+  } catch (error) {
+    console.error('❌ Erreur top reports:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 app.get('/api/reports/:id', async (req, res) => {
   try {
     const report = await Report.findById(req.params.id)
@@ -2453,6 +2483,140 @@ app.get('/api/admin/dashboard', requireAuth, requireAdmin, async (req, res) => {
     res.json(result);
   } catch (error) {
     console.error('❌ Erreur dashboard:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+
+
+// ── GET /api/admin/votes/stats — statistiques agrégées des votes ──
+app.get('/api/admin/votes/stats', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const cached = getCache('stats:votes');
+    if (cached) return res.json(cached);
+
+    const [topVoted, controversial, votesByType, votesByRegion, recentActivity] = await Promise.all([
+      // Top 5 signalements les plus votés positivement
+      Report.find({ voteCount: { $gt: 0 } })
+        .sort({ voteCount: -1 }).limit(5)
+        .select('title description type severity status location voteCount votes')
+        .populate('citizen', 'firstName lastName')
+        .lean(),
+
+      // Top 5 signalements controversés (beaucoup de votes, score proche de 0)
+      Report.aggregate([
+        { $addFields: {
+            totalVotes: { $size: { $ifNull: ['$votes', []] } },
+            upCount:    { $size: { $filter: { input: { $ifNull: ['$votes', []] }, cond: { $eq: ['$$this.voteType', 'up'] } } } },
+          },
+        },
+        { $match: { totalVotes: { $gte: 3 } } },
+        { $addFields: {
+            controversy: { $abs: { $subtract: [{ $multiply: [{ $divide: ['$upCount', '$totalVotes'] }, 100] }, 50] } },
+          },
+        },
+        { $sort: { controversy: 1, totalVotes: -1 } },
+        { $limit: 5 },
+        { $project: { title: 1, description: 1, type: 1, severity: 1, status: 1, voteCount: 1, totalVotes: 1, upCount: 1 } },
+      ]),
+
+      // Votes moyens par type de signalement
+      Report.aggregate([
+        { $match: { voteCount: { $exists: true } } },
+        { $group: {
+            _id:           '$type',
+            avgScore:      { $avg: '$voteCount' },
+            totalReports:  { $sum: 1 },
+            totalVotes:    { $sum: { $size: { $ifNull: ['$votes', []] } } },
+            positiveReports: { $sum: { $cond: [{ $gt: ['$voteCount', 0] }, 1, 0] } },
+          },
+        },
+        { $sort: { avgScore: -1 } },
+      ]),
+
+      // Votes par région
+      Report.aggregate([
+        { $match: { 'location.region': { $exists: true, $ne: '' } } },
+        { $group: {
+            _id:        '$location.region',
+            totalVotes: { $sum: { $size: { $ifNull: ['$votes', []] } } },
+            avgScore:   { $avg: '$voteCount' },
+            reports:    { $sum: 1 },
+          },
+        },
+        { $sort: { totalVotes: -1 } },
+        { $limit: 8 },
+      ]),
+
+      // Activité de vote des 30 derniers jours
+      Report.aggregate([
+        { $unwind: { path: '$votes', preserveNullAndEmptyArrays: false } },
+        { $match: { 'votes.createdAt': { $gte: new Date(Date.now() - 30 * 86400000) } } },
+        { $group: {
+            _id: {
+              year:  { $year:  '$votes.createdAt' },
+              month: { $month: '$votes.createdAt' },
+              day:   { $dayOfMonth: '$votes.createdAt' },
+              type:  '$votes.voteType',
+            },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { '_id.year': 1, '_id.month': 1, '_id.day': 1 } },
+      ]),
+    ]);
+
+    // Totaux globaux
+    const totals = await Report.aggregate([
+      { $project: {
+          upvotes:   { $size: { $filter: { input: { $ifNull: ['$votes', []] }, cond: { $eq: ['$$this.voteType', 'up'] } } } },
+          downvotes: { $size: { $filter: { input: { $ifNull: ['$votes', []] }, cond: { $eq: ['$$this.voteType', 'down'] } } } },
+        },
+      },
+      { $group: {
+          _id:         null,
+          totalUp:     { $sum: '$upvotes' },
+          totalDown:   { $sum: '$downvotes' },
+          totalVotes:  { $sum: { $add: ['$upvotes', '$downvotes'] } },
+          avgScore:    { $avg: '$upvotes' },
+          withVotes:   { $sum: { $cond: [{ $gt: [{ $add: ['$upvotes', '$downvotes'] }, 0] }, 1, 0] } },
+        },
+      },
+    ]);
+
+    const t = totals[0] || { totalUp: 0, totalDown: 0, totalVotes: 0, withVotes: 0 };
+
+    // Formater recentActivity en série temporelle
+    const activityMap = new Map();
+    recentActivity.forEach(d => {
+      const date = new Date(d._id.year, d._id.month - 1, d._id.day).toISOString().split('T')[0];
+      if (!activityMap.has(date)) activityMap.set(date, { date, up: 0, down: 0 });
+      activityMap.get(date)[d._id.type] = d.count;
+    });
+    const activitySeries = Array.from(activityMap.values()).sort((a, b) => a.date.localeCompare(b.date));
+
+    const result = {
+      success: true,
+      data: {
+        totals: {
+          totalVotes: t.totalVotes,
+          totalUp:    t.totalUp,
+          totalDown:  t.totalDown,
+          upRatio:    t.totalVotes > 0 ? Math.round(t.totalUp / t.totalVotes * 100) : 0,
+          withVotes:  t.withVotes,
+        },
+        topVoted:      topVoted.map(r => ({ ...r, votes: undefined })),
+        controversial,
+        votesByType,
+        votesByRegion,
+        activitySeries,
+      },
+    };
+
+    setCache('stats:votes', result, 2 * 60 * 1000);
+    res.json(result);
+  } catch (error) {
+    console.error('❌ Erreur votes stats:', error);
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
