@@ -2621,6 +2621,159 @@ app.get('/api/admin/votes/stats', requireAuth, requireAdmin, async (req, res) =>
   }
 });
 
+
+// ══════════════════════════════════════════════════════════════
+// ADMIN — GESTION DES VOTES
+// ══════════════════════════════════════════════════════════════
+
+// ── GET /api/admin/reports/:id/votes — liste détaillée des votes d'un signalement ──
+app.get('/api/admin/reports/:id/votes', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const report = await Report.findById(req.params.id)
+      .select('title description type severity status votes voteCount location')
+      .populate({ path: 'votes.userId', select: 'firstName lastName email community role createdAt', model: 'User' })
+      .lean();
+
+    if (!report) return res.status(404).json({ success: false, error: 'Signalement non trouvé' });
+
+    const votes     = report.votes || [];
+    const upvotes   = votes.filter(v => v.voteType === 'up').length;
+    const downvotes = votes.filter(v => v.voteType === 'down').length;
+
+    const enriched = votes.map(v => ({
+      userId:    v.userId?._id || v.userId,
+      voteType:  v.voteType,
+      createdAt: v.createdAt,
+      user: v.userId && typeof v.userId === 'object' ? {
+        id:        v.userId._id,
+        name:      `${v.userId.firstName || ''} ${v.userId.lastName || ''}`.trim() || 'Inconnu',
+        email:     v.userId.email,
+        community: v.userId.community,
+        role:      v.userId.role,
+        memberSince: v.userId.createdAt,
+      } : { id: v.userId, name: 'Utilisateur supprimé', email: null, community: null, role: null },
+    })).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+    res.json({
+      success: true,
+      data: {
+        report: {
+          id:       report._id,
+          title:    report.title || report.description?.substring(0, 60) || 'Sans titre',
+          type:     report.type,
+          severity: report.severity,
+          status:   report.status,
+          city:     report.location?.city || '',
+        },
+        votes:    enriched,
+        summary:  { total: votes.length, upvotes, downvotes, score: upvotes - downvotes },
+      },
+    });
+  } catch (error) {
+    console.error('❌ Erreur liste votes admin:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── DELETE /api/admin/reports/:id/votes/:userId — supprimer le vote d'un utilisateur ──
+app.delete('/api/admin/reports/:id/votes/:userId', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const report = await Report.findById(req.params.id);
+    if (!report) return res.status(404).json({ success: false, error: 'Signalement non trouvé' });
+
+    const before = report.votes?.length || 0;
+    report.votes  = (report.votes || []).filter(v => String(v.userId) !== req.params.userId);
+    const removed = before - report.votes.length;
+
+    if (removed === 0) return res.status(404).json({ success: false, error: 'Vote non trouvé pour cet utilisateur' });
+
+    report.voteCount = report.votes.filter(v => v.voteType === 'up').length
+                     - report.votes.filter(v => v.voteType === 'down').length;
+    report.markModified('votes');
+    await report.save();
+
+    invalidateCache('stats:');
+
+    console.log(`🗑️ Vote supprimé : user ${req.params.userId} sur report ${req.params.id} par admin ${req.user.email}`);
+    res.json({
+      success: true,
+      message: 'Vote supprimé avec succès',
+      data: {
+        removed,
+        newScore:    report.voteCount,
+        newUpvotes:  report.votes.filter(v => v.voteType === 'up').length,
+        newDownvotes:report.votes.filter(v => v.voteType === 'down').length,
+        total:       report.votes.length,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Erreur suppression vote:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── DELETE /api/admin/reports/:id/votes — réinitialiser TOUS les votes ──
+app.delete('/api/admin/reports/:id/votes', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const report = await Report.findById(req.params.id);
+    if (!report) return res.status(404).json({ success: false, error: 'Signalement non trouvé' });
+
+    const count   = report.votes?.length || 0;
+    report.votes  = [];
+    report.voteCount = 0;
+    report.markModified('votes');
+    await report.save();
+
+    invalidateCache('stats:');
+
+    console.log(`🗑️ ${count} votes réinitialisés sur report ${req.params.id} par admin ${req.user.email}`);
+    res.json({ success: true, message: `${count} vote${count > 1 ? 's' : ''} supprimé${count > 1 ? 's' : ''}`, data: { removed: count } });
+  } catch (error) {
+    console.error('❌ Erreur réinitialisation votes:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── PATCH /api/admin/reports/:id/votes/:userId — modifier le type d'un vote ──
+app.patch('/api/admin/reports/:id/votes/:userId', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { voteType } = req.body;
+    if (!['up', 'down'].includes(voteType)) {
+      return res.status(400).json({ success: false, error: 'Type de vote invalide (up ou down)' });
+    }
+
+    const report = await Report.findById(req.params.id);
+    if (!report) return res.status(404).json({ success: false, error: 'Signalement non trouvé' });
+
+    const vote = (report.votes || []).find(v => String(v.userId) === req.params.userId);
+    if (!vote) return res.status(404).json({ success: false, error: 'Vote non trouvé' });
+
+    const oldType = vote.voteType;
+    vote.voteType = voteType;
+    report.voteCount = report.votes.filter(v => v.voteType === 'up').length
+                     - report.votes.filter(v => v.voteType === 'down').length;
+    report.markModified('votes');
+    await report.save();
+
+    invalidateCache('stats:');
+
+    console.log(`✏️ Vote modifié : user ${req.params.userId} : ${oldType} → ${voteType} sur ${req.params.id} par admin ${req.user.email}`);
+    res.json({
+      success: true,
+      message: `Vote modifié de "${oldType}" vers "${voteType}"`,
+      data: {
+        oldType, newType: voteType,
+        newScore:    report.voteCount,
+        newUpvotes:  report.votes.filter(v => v.voteType === 'up').length,
+        newDownvotes:report.votes.filter(v => v.voteType === 'down').length,
+      },
+    });
+  } catch (error) {
+    console.error('❌ Erreur modification vote:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 // ==================== GESTION DES ERREURS ====================
 
 app.use('*', (req, res) => {
