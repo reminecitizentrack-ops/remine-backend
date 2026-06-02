@@ -1873,6 +1873,51 @@ app.post('/api/admin/demo-data', requireAuth, requireAdmin, async (req, res) => 
   }
 });
 
+
+// ── DELETE /api/admin/demo-data — supprimer toutes les données de démo ──
+app.delete('/api/admin/demo-data', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    // Trouver l'utilisateur démo
+    const demoUser = await User.findOne({ email: 'demo@remine.sn' });
+
+    if (!demoUser) {
+      return res.json({ success: true, message: 'Aucune donnée de démo trouvée', data: { deleted: 0 } });
+    }
+
+    // Supprimer tous les signalements créés par l'utilisateur démo
+    const result = await Report.deleteMany({ citizen: demoUser._id });
+    const deleted = result.deletedCount || 0;
+
+    // Optionnel : supprimer aussi l'utilisateur démo
+    const { deleteUser } = req.query;
+    let userDeleted = false;
+    if (deleteUser === 'true') {
+      await User.deleteOne({ _id: demoUser._id });
+      userDeleted = true;
+    }
+
+    // Invalider tous les caches
+    invalidateCache('stats:');
+    invalidateCache('reports:');
+    invalidateCache('users:');
+
+    // Notifier via Socket.IO
+    if (global.io) {
+      global.io.emit('demo-data-deleted', { count: deleted });
+    }
+
+    console.log(`🗑️ Données démo supprimées : ${deleted} signalements par admin ${req.user.email}`);
+    res.json({
+      success: true,
+      message: `${deleted} signalement${deleted > 1 ? 's' : ''} de démo supprimé${deleted > 1 ? 's' : ''}${userDeleted ? ' + utilisateur démo supprimé' : ''}`,
+      data: { deleted, userDeleted },
+    });
+  } catch (error) {
+    console.error('❌ Erreur suppression demo-data:', error);
+    res.status(500).json({ success: false, error: 'Erreur lors de la suppression des données de démo' });
+  }
+});
+
 // ==================== ROUTE ACTIVITÉ 7 JOURS (graphique réel) ====================
 
 app.get('/api/admin/activity', requireAuth, requireAdmin, async (req, res) => {
