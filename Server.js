@@ -402,6 +402,21 @@ reportSchema.statics.getStats = async function () {
 
 const Report = mongoose.model('Report', reportSchema);
 
+// ── Schéma Message admin → citoyen ────────────────────────────────────────────
+const messageSchema = new mongoose.Schema({
+  from:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  to:        { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  subject:   { type: String, required: true, trim: true, maxlength: 200 },
+  content:   { type: String, required: true, trim: true, maxlength: 5000 },
+  reportId:  { type: mongoose.Schema.Types.ObjectId, ref: 'Report', default: null },
+  read:      { type: Boolean, default: false },
+  readAt:    { type: Date,    default: null },
+  parentId:  { type: mongoose.Schema.Types.ObjectId, ref: 'Message', default: null },
+  thread:    [{ type: mongoose.Schema.Types.ObjectId, ref: 'Message' }],
+}, { timestamps: true });
+const Message = mongoose.model('Message', messageSchema);
+
+
 // ==================== UTILITAIRES ====================
 
 function calculateConfidenceScore(description, images, metadata) {
@@ -2818,6 +2833,165 @@ app.patch('/api/admin/reports/:id/votes/:userId', requireAuth, requireAdmin, asy
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
+
+
+// ══════════════════════════════════════════════════════════════
+// MESSAGERIE ADMIN → CITOYEN
+// ══════════════════════════════════════════════════════════════
+
+// ── GET /api/messages/all — tous les messages envoyés par les admins ──
+app.get('/api/messages/all', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 50, unreadOnly } = req.query;
+    const filter = { parentId: null }; // messages racines seulement
+    if (unreadOnly === 'true') filter.read = false;
+
+    const messages = await Message.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip((parseInt(page) - 1) * parseInt(limit))
+      .populate('from', 'firstName lastName email role')
+      .populate('to',   'firstName lastName email community')
+      .populate('reportId', 'type severity status location')
+      .lean();
+
+    const total  = await Message.countDocuments(filter);
+    const unread = await Message.countDocuments({ ...filter, read: false });
+
+    res.json({ success: true, data: messages, meta: { total, unread, page: parseInt(page) } });
+  } catch (error) {
+    console.error('❌ Erreur messages/all:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── GET /api/messages/:id — détail d'un message + thread ──
+app.get('/api/messages/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const msg = await Message.findById(req.params.id)
+      .populate('from', 'firstName lastName email role')
+      .populate('to',   'firstName lastName email community createdAt')
+      .populate('reportId', 'type severity status location description createdAt')
+      .lean();
+
+    if (!msg) return res.status(404).json({ success: false, error: 'Message non trouvé' });
+
+    // Charger les réponses du thread
+    const replies = await Message.find({ parentId: req.params.id })
+      .sort({ createdAt: 1 })
+      .populate('from', 'firstName lastName email role')
+      .lean();
+
+    res.json({ success: true, data: { ...msg, replies } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── POST /api/messages — envoyer un nouveau message ──
+app.post('/api/messages', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { toUserId, subject, content, reportId, parentId } = req.body;
+
+    if (!toUserId)        return res.status(400).json({ success: false, error: 'Destinataire requis' });
+    if (!subject?.trim()) return res.status(400).json({ success: false, error: 'Sujet requis' });
+    if (!content?.trim()) return res.status(400).json({ success: false, error: 'Contenu requis' });
+
+    const recipient = await User.findById(toUserId).select('firstName lastName email');
+    if (!recipient) return res.status(404).json({ success: false, error: 'Destinataire non trouvé' });
+
+    const msg = await Message.create({
+      from:     req.user.id,
+      to:       toUserId,
+      subject:  subject.trim(),
+      content:  content.trim(),
+      reportId: reportId || null,
+      parentId: parentId || null,
+    });
+
+    await msg.populate([
+      { path: 'from', select: 'firstName lastName email role' },
+      { path: 'to',   select: 'firstName lastName email community' },
+      { path: 'reportId', select: 'type severity status' },
+    ]);
+
+    // Notifier via Socket.IO
+    if (global.io) {
+      global.io.to(`user:${toUserId}`).emit('new-message', {
+        id:      msg._id,
+        subject: msg.subject,
+        from:    `${req.user.firstName || 'Admin'}`,
+        preview: content.trim().substring(0, 80),
+      });
+    }
+
+    // Notifier via push
+    if (global.notifyUser) {
+      global.notifyUser(String(toUserId), 'new_message', {
+        subject: msg.subject,
+        from:    `${req.user.firstName || 'Admin'} (ReMine)`,
+      });
+    }
+
+    console.log(`✉️ Message envoyé : admin ${req.user.email} → ${recipient.email}`);
+    res.status(201).json({ success: true, data: msg });
+  } catch (error) {
+    console.error('❌ Erreur envoi message:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── PUT /api/messages/:id/read — marquer comme lu ──
+app.put('/api/messages/:id/read', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const msg = await Message.findByIdAndUpdate(
+      req.params.id,
+      { read: true, readAt: new Date() },
+      { new: true }
+    );
+    if (!msg) return res.status(404).json({ success: false, error: 'Message non trouvé' });
+    res.json({ success: true, data: msg });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── DELETE /api/messages/:id — supprimer un message ──
+app.delete('/api/messages/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    await Message.findByIdAndDelete(req.params.id);
+    // Supprimer les réponses associées
+    await Message.deleteMany({ parentId: req.params.id });
+    res.json({ success: true, message: 'Message supprimé' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── GET /api/messages/stats — statistiques de messagerie ──
+app.get('/api/messages/stats', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const [total, unread, thisWeek] = await Promise.all([
+      Message.countDocuments({ parentId: null }),
+      Message.countDocuments({ parentId: null, read: false }),
+      Message.countDocuments({ parentId: null, createdAt: { $gte: new Date(Date.now() - 7 * 86400000) } }),
+    ]);
+    // Top citoyens contactés
+    const topRecipients = await Message.aggregate([
+      { $match: { parentId: null } },
+      { $group: { _id: '$to', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 5 },
+      { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
+      { $unwind: '$user' },
+      { $project: { count: 1, name: { $concat: ['$user.firstName', ' ', '$user.lastName'] }, email: '$user.email' } },
+    ]);
+    res.json({ success: true, data: { total, unread, thisWeek, topRecipients } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 
 // ==================== GESTION DES ERREURS ====================
 
