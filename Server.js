@@ -938,7 +938,15 @@ app.post('/api/reports', requireAuth, uploadLimiter, async (req, res) => {
 
     if (global.io) {
       global.io.emit('new-report', { type: 'NEW_REPORT', data: report });
-      if (global.emitSSE) global.emitSSE('new-report', { type: 'NEW_REPORT', reportId: report._id, reportType: report.type, severity: report.severity });
+      if (global.emitSSE) global.emitSSE('new-report', {
+        type: 'NEW_REPORT',
+        reportId:   report._id,
+        reportType: report.type,
+        severity:   report.severity,
+        city:       report.location?.city || '',
+        citizen:    req.body.citizenName || '',
+        title:      report.title || report.description?.substring(0, 50) || '',
+      });
     }
 
     invalidateCache('stats:');
@@ -2932,6 +2940,13 @@ app.post('/api/messages', requireAuth, requireAdmin, async (req, res) => {
         from:    `${req.user.firstName || 'Admin'} (ReMine)`,
       });
     }
+
+    // SSE → tous les admins voient la confirmation d'envoi
+    if (global.emitSSE) global.emitSSE('message-sent', {
+      messageId: msg._id,
+      to: { name: `${recipient.firstName || ''} ${recipient.lastName || ''}`.trim(), email: recipient.email },
+      subject: msg.subject,
+    });
 
     console.log(`✉️ Message envoyé : admin ${req.user.email} → ${recipient.email}`);
     res.status(201).json({ success: true, data: msg });
