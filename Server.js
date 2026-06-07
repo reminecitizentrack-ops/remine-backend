@@ -206,8 +206,15 @@ const userSchema = new mongoose.Schema({
   role:      { type: String, default: 'citizen', enum: ['citizen', 'admin', 'moderator'] },
   community: { type: String, default: '', trim: true },
   phone:     { type: String, default: '', trim: true },
-  isActive:  { type: Boolean, default: true },
-  lastLogin: { type: Date },
+  isActive:   { type: Boolean, default: true },
+  isBanned:   { type: Boolean, default: false },
+  banReason:  { type: String,  default: '' },
+  banExpiry:  { type: Date,    default: null },  // null = permanent
+  bannedBy:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  bannedAt:   { type: Date,    default: null },
+  lastLogin:  { type: Date },
+  loginCount: { type: Number,  default: 0 },
+  notes:      { type: String,  default: '' },    // notes internes admin
 }, { timestamps: true });
 
 userSchema.methods.toPublicJSON = function () {
@@ -3007,6 +3014,137 @@ app.get('/api/messages/stats', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+
+
+// ══════════════════════════════════════════════════════════════
+// ADMIN — GESTION AVANCÉE DES UTILISATEURS
+// ══════════════════════════════════════════════════════════════
+
+// ── GET /api/admin/users/:id/detail — profil complet + stats ──
+app.get('/api/admin/users/:id/detail', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id)
+      .select('-password -pushTokens')
+      .populate('bannedBy', 'firstName lastName email')
+      .lean();
+    if (!user) return res.status(404).json({ success: false, error: 'Utilisateur non trouvé' });
+
+    const [reportCount, reportsByStatus, recentReports] = await Promise.all([
+      Report.countDocuments({ citizen: req.params.id }),
+      Report.aggregate([
+        { $match: { citizen: user._id } },
+        { $group: { _id: '$status', count: { $sum: 1 } } },
+      ]),
+      Report.find({ citizen: req.params.id })
+        .sort({ createdAt: -1 }).limit(5)
+        .select('type severity status createdAt location')
+        .lean(),
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        ...user,
+        stats: {
+          totalReports: reportCount,
+          byStatus: reportsByStatus.reduce((acc, s) => { acc[s._id] = s.count; return acc; }, {}),
+        },
+        recentReports,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── POST /api/admin/users/:id/ban — bannir un utilisateur ──
+app.post('/api/admin/users/:id/ban', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { reason, durationDays } = req.body;
+    if (!reason?.trim()) return res.status(400).json({ success: false, error: 'Raison requise' });
+
+    const expiry = durationDays ? new Date(Date.now() + durationDays * 86400000) : null;
+
+    const user = await User.findByIdAndUpdate(req.params.id, {
+      isBanned:  true,
+      isActive:  false,
+      banReason: reason.trim(),
+      banExpiry: expiry,
+      bannedBy:  req.user.id,
+      bannedAt:  new Date(),
+    }, { new: true }).select('-password');
+
+    if (!user) return res.status(404).json({ success: false, error: 'Utilisateur non trouvé' });
+
+    // Invalider les tokens de session
+    await PushToken.updateMany({ userId: req.params.id }, { isActive: false });
+    invalidateCache('users:');
+
+    console.log(`🚫 Utilisateur banni : ${user.email} par admin ${req.user.email} — Raison: ${reason}`);
+    res.json({
+      success: true,
+      message: `${user.firstName || user.email} banni${expiry ? ` jusqu'au ${expiry.toLocaleDateString('fr-FR')}` : ' définitivement'}`,
+      data: user,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── POST /api/admin/users/:id/unban — débannir un utilisateur ──
+app.post('/api/admin/users/:id/unban', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(req.params.id, {
+      isBanned:  false,
+      isActive:  true,
+      banReason: '',
+      banExpiry: null,
+      bannedBy:  null,
+      bannedAt:  null,
+    }, { new: true }).select('-password');
+
+    if (!user) return res.status(404).json({ success: false, error: 'Utilisateur non trouvé' });
+    invalidateCache('users:');
+
+    console.log(`✅ Utilisateur débanni : ${user.email} par admin ${req.user.email}`);
+    res.json({ success: true, message: `${user.firstName || user.email} débanni`, data: user });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── PATCH /api/admin/users/:id/notes — mettre à jour les notes internes ──
+app.patch('/api/admin/users/:id/notes', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { notes } = req.body;
+    const user = await User.findByIdAndUpdate(req.params.id, { notes: (notes || '').trim() }, { new: true }).select('-password');
+    if (!user) return res.status(404).json({ success: false, error: 'Utilisateur non trouvé' });
+    res.json({ success: true, data: user });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── PATCH /api/admin/users/:id/profile — modifier profil par admin ──
+app.patch('/api/admin/users/:id/profile', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const allowed = ['firstName','lastName','email','community','phone','role'];
+    const updates = {};
+    allowed.forEach(k => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
+
+    if (Object.keys(updates).length === 0)
+      return res.status(400).json({ success: false, error: 'Aucune modification' });
+
+    const user = await User.findByIdAndUpdate(req.params.id, updates, { new: true }).select('-password');
+    if (!user) return res.status(404).json({ success: false, error: 'Utilisateur non trouvé' });
+    invalidateCache('users:');
+
+    console.log(`✏️ Profil modifié : ${user.email} par admin ${req.user.email}`);
+    res.json({ success: true, data: user });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
 
 // ==================== GESTION DES ERREURS ====================
 
