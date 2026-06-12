@@ -15,6 +15,17 @@ import rateLimit from 'express-rate-limit';
 import { Resend } from 'resend';
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+import nodemailer from 'nodemailer';
+const gmailTransporter = (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD)
+  ? nodemailer.createTransport({
+      service: 'gmail',
+      auth: {
+        user: process.env.GMAIL_USER,
+        pass: process.env.GMAIL_APP_PASSWORD,
+      },
+    })
+  : null;
+
 // ==================== CONFIGURATION ====================
 
 const PORT        = process.env.PORT        || 5001;
@@ -662,11 +673,7 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
 
     const resetUrl = `https://remine-dashboard.vercel.app/reset-password?token=${resetToken}&email=${encodeURIComponent(email)}`;
 
-    await resend.emails.send({
-      from: 'ReMine <onboarding@resend.dev>',
-      to: email,
-      subject: '🔐 Réinitialisation de votre mot de passe ReMine',
-      html: `
+    const emailHtml = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
           <div style="background: #16a34a; padding: 20px; border-radius: 12px 12px 0 0; text-align: center;">
             <h1 style="color: white; margin: 0;">🌍 ReMine Citizen Track</h1>
@@ -680,13 +687,51 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
                 Réinitialiser mon mot de passe
               </a>
             </div>
-            <p style="color: #9ca3af; font-size: 13px;">Ce lien expire dans 1 heure. Si vous n\'avez pas fait cette demande, ignorez cet email.</p>
+            <p style="color: #9ca3af; font-size: 13px;">Ce lien expire dans 1 heure. Si vous n'avez pas fait cette demande, ignorez cet email.</p>
           </div>
         </div>
-      `
-    });
+      `;
 
-    console.log('✅ Email de réinitialisation envoyé à', email);
+    let emailSent = false;
+
+    // ── Envoi via Gmail (expéditeur = reminecitizentrack@gmail.com) ──────────
+    if (gmailTransporter) {
+      try {
+        const info = await gmailTransporter.sendMail({
+          from: `"ReMine Citizen Track" <${process.env.GMAIL_USER}>`,
+          to: email,
+          subject: '🔐 Réinitialisation de votre mot de passe ReMine',
+          html: emailHtml,
+        });
+        console.log('✅ Email de réinitialisation envoyé via Gmail à', email, '— id:', info.messageId);
+        emailSent = true;
+      } catch (gmailError) {
+        console.error('❌ Erreur Gmail:', gmailError.message);
+      }
+    } else {
+      console.error("❌ GMAIL_USER / GMAIL_APP_PASSWORD non configurés dans les variables d'environnement");
+    }
+
+    // ── Fallback Resend si Gmail indisponible ────────────────────────────────
+    if (!emailSent && process.env.RESEND_API_KEY) {
+      const { data: emailData, error: emailError } = await resend.emails.send({
+        from: 'ReMine <onboarding@resend.dev>',
+        to: email,
+        subject: '🔐 Réinitialisation de votre mot de passe ReMine',
+        html: emailHtml,
+      });
+      if (emailError) {
+        console.error('❌ Erreur Resend (fallback):', JSON.stringify(emailError));
+      } else {
+        console.log('✅ Email de réinitialisation envoyé via Resend (fallback) à', email, '— id:', emailData?.id);
+        emailSent = true;
+      }
+    }
+
+    if (!emailSent) {
+      console.error('❌ Aucun service email disponible — email non envoyé à', email);
+    }
+
     res.json({ success: true, message: 'Un lien de réinitialisation a été envoyé à votre adresse email.' });
 
   } catch (error) {
