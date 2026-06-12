@@ -15,28 +15,32 @@ import rateLimit from 'express-rate-limit';
 import { Resend } from 'resend';
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-import nodemailer from 'nodemailer';
-import dns from 'dns';
-// Render (et certains hébergeurs) ne supportent pas bien la sortie IPv6 vers Gmail SMTP,
-// ce qui cause des erreurs "ENETUNREACH" sur les adresses IPv6 de Google.
-// On force la résolution DNS à privilégier IPv4.
-dns.setDefaultResultOrder('ipv4first');
-
-const gmailTransporter = (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD)
-  ? nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 465,
-      secure: true,
-      auth: {
-        user: process.env.GMAIL_USER,
-        pass: process.env.GMAIL_APP_PASSWORD,
-      },
-      family: 4, // force IPv4
-      connectionTimeout: 15000,
-      greetingTimeout: 15000,
-      socketTimeout: 15000,
-    })
-  : null;
+// ── Brevo (ex-Sendinblue) — envoi d'emails via API HTTP (fonctionne sur Render,
+// contrairement au SMTP qui est bloqué sur le plan gratuit) ────────────────────
+async function sendViaBrevo({ to, subject, html, senderName = 'ReMine Citizen Track' }) {
+  if (!process.env.BREVO_API_KEY || !process.env.BREVO_SENDER_EMAIL) {
+    throw new Error('BREVO_API_KEY ou BREVO_SENDER_EMAIL non configuré');
+  }
+  const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json',
+      'api-key': process.env.BREVO_API_KEY,
+    },
+    body: JSON.stringify({
+      sender: { name: senderName, email: process.env.BREVO_SENDER_EMAIL },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+    }),
+  });
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.message || `Erreur Brevo (${response.status})`);
+  }
+  return data; // { messageId: '...' }
+}
 
 // ==================== CONFIGURATION ====================
 
@@ -706,25 +710,24 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
 
     let emailSent = false;
 
-    // ── Envoi via Gmail (expéditeur = reminecitizentrack@gmail.com) ──────────
-    if (gmailTransporter) {
+    // ── Envoi via Brevo (API HTTP — fonctionne sur Render) ────────────────────
+    if (process.env.BREVO_API_KEY && process.env.BREVO_SENDER_EMAIL) {
       try {
-        const info = await gmailTransporter.sendMail({
-          from: `"ReMine Citizen Track" <${process.env.GMAIL_USER}>`,
+        const result = await sendViaBrevo({
           to: email,
           subject: '🔐 Réinitialisation de votre mot de passe ReMine',
           html: emailHtml,
         });
-        console.log('✅ Email de réinitialisation envoyé via Gmail à', email, '— id:', info.messageId);
+        console.log('✅ Email de réinitialisation envoyé via Brevo à', email, '— id:', result.messageId);
         emailSent = true;
-      } catch (gmailError) {
-        console.error('❌ Erreur Gmail:', gmailError.message);
+      } catch (brevoError) {
+        console.error('❌ Erreur Brevo:', brevoError.message);
       }
     } else {
-      console.error("❌ GMAIL_USER / GMAIL_APP_PASSWORD non configurés dans les variables d'environnement");
+      console.error("❌ BREVO_API_KEY / BREVO_SENDER_EMAIL non configurés dans les variables d'environnement");
     }
 
-    // ── Fallback Resend si Gmail indisponible ────────────────────────────────
+    // ── Fallback Resend si Brevo indisponible ─────────────────────────────────
     if (!emailSent && process.env.RESEND_API_KEY) {
       const { data: emailData, error: emailError } = await resend.emails.send({
         from: 'ReMine <onboarding@resend.dev>',
