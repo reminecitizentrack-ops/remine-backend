@@ -16,13 +16,25 @@ import { Resend } from 'resend';
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 import nodemailer from 'nodemailer';
+import dns from 'dns';
+// Render (et certains hébergeurs) ne supportent pas bien la sortie IPv6 vers Gmail SMTP,
+// ce qui cause des erreurs "ENETUNREACH" sur les adresses IPv6 de Google.
+// On force la résolution DNS à privilégier IPv4.
+dns.setDefaultResultOrder('ipv4first');
+
 const gmailTransporter = (process.env.GMAIL_USER && process.env.GMAIL_APP_PASSWORD)
   ? nodemailer.createTransport({
-      service: 'gmail',
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
       auth: {
         user: process.env.GMAIL_USER,
         pass: process.env.GMAIL_APP_PASSWORD,
       },
+      family: 4, // force IPv4
+      connectionTimeout: 15000,
+      greetingTimeout: 15000,
+      socketTimeout: 15000,
     })
   : null;
 
