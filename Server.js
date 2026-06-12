@@ -215,6 +215,8 @@ const userSchema = new mongoose.Schema({
   lastLogin:  { type: Date },
   loginCount: { type: Number,  default: 0 },
   notes:      { type: String,  default: '' },    // notes internes admin
+  resetPasswordToken:   { type: String, default: null },
+  resetPasswordExpires: { type: Date,   default: null },
 }, { timestamps: true });
 
 userSchema.methods.toPublicJSON = function () {
@@ -692,6 +694,72 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
+
+// ── POST /api/auth/confirm-reset-password — applique le nouveau mot de passe ──
+app.post('/api/auth/confirm-reset-password', authLimiter, async (req, res) => {
+  try {
+    const { email, token, newPassword } = req.body;
+
+    if (!email || !token || !newPassword) {
+      return res.status(400).json({ success: false, error: 'Champs manquants' });
+    }
+    if (newPassword.length < 8) {
+      return res.status(400).json({ success: false, error: 'Le mot de passe doit contenir au moins 8 caractères' });
+    }
+
+    const user = await User.findOne({
+      email: email.toLowerCase().trim(),
+      resetPasswordToken: token,
+      resetPasswordExpires: { $gt: new Date() },
+    });
+
+    if (!user) {
+      return res.status(400).json({ success: false, error: 'Lien invalide ou expiré. Veuillez refaire une demande.' });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.resetPasswordToken = null;
+    user.resetPasswordExpires = null;
+    await user.save();
+
+    // Désactiver les sessions push existantes par sécurité
+    await PushToken.updateMany({ userId: user._id }, { isActive: false });
+
+    console.log('✅ Mot de passe réinitialisé pour', user.email);
+    res.json({ success: true, message: 'Mot de passe réinitialisé avec succès. Vous pouvez vous connecter.' });
+
+  } catch (error) {
+    console.error('❌ Erreur confirm-reset-password:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── GET /api/auth/verify-reset-token — vérifie la validité d'un token (sans le consommer) ──
+app.get('/api/auth/verify-reset-token', authLimiter, async (req, res) => {
+  try {
+    const { email, token } = req.query;
+    if (!email || !token) {
+      return res.status(400).json({ success: false, error: 'Paramètres manquants' });
+    }
+
+    const user = await User.findOne({
+      email: String(email).toLowerCase().trim(),
+      resetPasswordToken: token,
+      resetPasswordExpires: { $gt: new Date() },
+    }).select('_id');
+
+    if (!user) {
+      return res.status(400).json({ success: false, error: 'Lien invalide ou expiré' });
+    }
+
+    res.json({ success: true, message: 'Lien valide' });
+
+  } catch (error) {
+    console.error('❌ Erreur verify-reset-token:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 
 // ==================== ROUTE LOGOUT ====================
 app.post('/api/auth/logout', requireAuth, async (req, res) => {
