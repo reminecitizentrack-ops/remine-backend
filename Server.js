@@ -829,16 +829,37 @@ app.post('/api/notifications/send', requireAuth, async (req, res) => {
 
 app.post('/api/notifications/broadcast', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { title, body, data = {}, targetRoles = [] } = req.body;
-    
+    const { title, body, data = {}, targetRoles = [], region = '' } = req.body;
+
     if (!title || !body) {
       return res.status(400).json({ success: false, error: 'Title et body requis' });
     }
 
     const filter = { isActive: true };
+
     if (targetRoles.length > 0) {
       const users = await User.find({ role: { $in: targetRoles } }).select('_id');
       filter.userId = { $in: users.map(u => u._id) };
+    }
+
+    // Ciblage par région : on identifie les citoyens ayant déjà signalé dans cette région
+    // ou dont le champ community correspond.
+    if (region) {
+      const regionRegex = new RegExp(region, 'i');
+      const [reporters, communityUsers] = await Promise.all([
+        Report.find({
+          $or: [{ 'location.region': regionRegex }, { 'location.city': regionRegex }],
+        }).select('citizenId').lean(),
+        User.find({ community: regionRegex }).select('_id').lean(),
+      ]);
+      const ids = new Set([
+        ...reporters.map(r => String(r.citizenId)),
+        ...communityUsers.map(u => String(u._id)),
+      ]);
+      if (ids.size === 0) {
+        return res.json({ success: false, error: `Aucun citoyen trouvé pour la région "${region}"` });
+      }
+      filter.userId = { $in: Array.from(ids).map(id => new mongoose.Types.ObjectId(id)) };
     }
 
     const tokens = await PushToken.find(filter);
@@ -890,7 +911,27 @@ app.post('/api/notifications/broadcast', requireAuth, requireAdmin, async (req, 
   }
 });
 
+// ── GET /api/notifications/stats — stats des tokens push (admin) ────────────
+app.get('/api/notifications/stats', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const [activeTokens, totalTokens, iosCount, androidCount] = await Promise.all([
+      PushToken.countDocuments({ isActive: true }),
+      PushToken.countDocuments({}),
+      PushToken.countDocuments({ isActive: true, platform: 'ios' }),
+      PushToken.countDocuments({ isActive: true, platform: 'android' }),
+    ]);
+    res.json({
+      success: true,
+      data: { activeTokens, totalTokens, ios: iosCount, android: androidCount },
+    });
+  } catch (error) {
+    console.error('❌ Erreur stats notifications:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
 // ==================== ROUTES SIGNALEMENTS ====================
+
 
 app.post('/api/reports', requireAuth, uploadLimiter, async (req, res) => {
   try {
