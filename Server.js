@@ -688,6 +688,7 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
     await user.save();
 
     const resetUrl = `https://remine-dashboard.vercel.app/reset-password?token=${resetToken}&email=${encodeURIComponent(email)}`;
+    const resetUrlApp = `remine://reset-password?token=${resetToken}&email=${encodeURIComponent(email)}`;
 
     const emailHtml = `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
@@ -698,16 +699,21 @@ app.post('/api/auth/reset-password', authLimiter, async (req, res) => {
           <div style="background: #f9fafb; padding: 30px; border-radius: 0 0 12px 12px; border: 1px solid #e5e7eb;">
             <h2 style="color: #111827;">Réinitialisation de mot de passe</h2>
             <p style="color: #6b7280;">Bonjour ${user.firstName || ''},</p>
-            <p style="color: #6b7280;">Vous avez demandé à réinitialiser votre mot de passe. Cliquez sur le bouton ci-dessous :</p>
+            <p style="color: #6b7280;">Vous avez demandé à réinitialiser votre mot de passe. Choisissez une option ci-dessous :</p>
             <div style="text-align: center; margin: 30px 0;">
-              <a href="${resetUrl}" style="background: #16a34a; color: white; padding: 14px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 16px;">
-                Réinitialiser mon mot de passe
+              <a href="${resetUrlApp}" style="display: inline-block; background: #16a34a; color: white; padding: 14px 28px; border-radius: 8px; text-decoration: none; font-weight: bold; font-size: 16px; margin-bottom: 12px;">
+                📱 Ouvrir dans l'application ReMine
+              </a>
+              <br/>
+              <a href="${resetUrl}" style="display: inline-block; margin-top: 12px; color: #16a34a; text-decoration: underline; font-size: 14px;">
+                Ou utiliser le navigateur web
               </a>
             </div>
             <p style="color: #9ca3af; font-size: 13px;">Ce lien expire dans 1 heure. Si vous n'avez pas fait cette demande, ignorez cet email.</p>
           </div>
         </div>
       `;
+
 
     let emailSent = false;
 
