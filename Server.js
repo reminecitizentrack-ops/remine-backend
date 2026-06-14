@@ -272,7 +272,26 @@ const pushTokenSchema = new mongoose.Schema({
 
 const PushToken = mongoose.model('PushToken', pushTokenSchema);
 
-// Modèle Report
+// ── Modèle NotificationLog — historique persistant des notifications envoyées ──
+const notificationLogSchema = new mongoose.Schema({
+  title:       { type: String, required: true },
+  body:        { type: String, required: true },
+  target:      { type: String, enum: ['broadcast', 'region', 'user'], default: 'broadcast' },
+  targetValue: { type: String, default: '' }, // region name or userId
+  templateId:  { type: String, default: 'custom' },
+  templateLabel: { type: String, default: 'Personnalisé' },
+  sentBy:      { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  sent:        { type: Number, default: 0 },
+  total:       { type: Number, default: 0 },
+  status:      { type: String, enum: ['sent', 'failed', 'scheduled', 'cancelled'], default: 'sent' },
+  scheduledAt: { type: Date, default: null },
+  sentAt:      { type: Date, default: null },
+  error:       { type: String, default: null },
+}, { timestamps: true });
+
+const NotificationLog = mongoose.model('NotificationLog', notificationLogSchema);
+
+
 const reportSchema = new mongoose.Schema({
   type: {
     type: String,
@@ -900,6 +919,89 @@ app.delete('/api/users/push-token', requireAuth, async (req, res) => {
   }
 });
 
+// ── Helper : envoie une notification broadcast et retourne {sent, total} ────────
+async function sendBroadcastHelper({ title, body, data = {}, region = '', targetRoles = [], userId = null }) {
+  const filter = { isActive: true };
+
+  if (userId) {
+    filter.userId = new mongoose.Types.ObjectId(userId);
+  } else {
+    if (targetRoles.length > 0) {
+      const users = await User.find({ role: { $in: targetRoles } }).select('_id');
+      filter.userId = { $in: users.map(u => u._id) };
+    }
+    if (region) {
+      const regionRegex = new RegExp(region, 'i');
+      const [reporters, communityUsers] = await Promise.all([
+        Report.find({ $or: [{ 'location.region': regionRegex }, { 'location.city': regionRegex }] }).select('citizenId').lean(),
+        User.find({ community: regionRegex }).select('_id').lean(),
+      ]);
+      const ids = new Set([
+        ...reporters.map(r => String(r.citizenId)),
+        ...communityUsers.map(u => String(u._id)),
+      ]);
+      if (ids.size === 0) return { sent: 0, total: 0, error: `Aucun citoyen pour la région "${region}"` };
+      filter.userId = { $in: Array.from(ids).map(id => new mongoose.Types.ObjectId(id)) };
+    }
+  }
+
+  const tokens = await PushToken.find(filter);
+  if (tokens.length === 0) return { sent: 0, total: 0, error: 'Aucun token actif' };
+
+  const batchSize = 100;
+  let sent = 0;
+  for (let i = 0; i < tokens.length; i += batchSize) {
+    const batch = tokens.slice(i, i + batchSize);
+    const messages = batch.map(token => ({
+      to: token.token, sound: 'default', title, body,
+      data: { ...data, timestamp: new Date().toISOString() }, priority: 'high',
+    }));
+    const response = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(messages),
+    });
+    const result = await response.json();
+    sent += result.data?.filter(r => r.status === 'ok').length || 0;
+    if (i + batchSize < tokens.length) await new Promise(r => setTimeout(r, 500));
+  }
+  return { sent, total: tokens.length };
+}
+
+// ── Cron : vérifie toutes les minutes les notifications planifiées ────────────
+setInterval(async () => {
+  try {
+    const due = await NotificationLog.find({
+      status: 'scheduled',
+      scheduledAt: { $lte: new Date() },
+    });
+    for (const notif of due) {
+      try {
+        const result = await sendBroadcastHelper({
+          title: notif.title,
+          body: notif.body,
+          data: { templateId: notif.templateId, scheduled: true },
+          region: notif.target === 'region' ? notif.targetValue : '',
+          userId: notif.target === 'user' ? notif.targetValue : null,
+        });
+        notif.status = 'sent';
+        notif.sent   = result.sent;
+        notif.total  = result.total;
+        notif.sentAt = new Date();
+        await notif.save();
+        console.log(`📅 Notification planifiée envoyée : "${notif.title}" → ${result.sent}/${result.total}`);
+      } catch (e) {
+        notif.status = 'failed';
+        notif.error  = e.message;
+        await notif.save();
+        console.error('❌ Erreur envoi notification planifiée:', e.message);
+      }
+    }
+  } catch (e) {
+    console.error('❌ Erreur cron notifications:', e.message);
+  }
+}, 60 * 1000);
+
 app.post('/api/notifications/send', requireAuth, async (req, res) => {
   try {
     const { userId, title, body, data = {} } = req.body;
@@ -964,81 +1066,27 @@ app.post('/api/notifications/send', requireAuth, async (req, res) => {
 
 app.post('/api/notifications/broadcast', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { title, body, data = {}, targetRoles = [], region = '' } = req.body;
+    const { title, body, data = {}, targetRoles = [], region = '', templateId = 'custom', templateLabel = 'Personnalisé', target = 'broadcast', targetValue = '' } = req.body;
 
-    if (!title || !body) {
-      return res.status(400).json({ success: false, error: 'Title et body requis' });
+    if (!title || !body) return res.status(400).json({ success: false, error: 'Title et body requis' });
+
+    const result = await sendBroadcastHelper({ title, body, data, region, targetRoles });
+
+    if (result.error && result.total === 0) {
+      return res.json({ success: false, error: result.error });
     }
 
-    const filter = { isActive: true };
-
-    if (targetRoles.length > 0) {
-      const users = await User.find({ role: { $in: targetRoles } }).select('_id');
-      filter.userId = { $in: users.map(u => u._id) };
-    }
-
-    // Ciblage par région : on identifie les citoyens ayant déjà signalé dans cette région
-    // ou dont le champ community correspond.
-    if (region) {
-      const regionRegex = new RegExp(region, 'i');
-      const [reporters, communityUsers] = await Promise.all([
-        Report.find({
-          $or: [{ 'location.region': regionRegex }, { 'location.city': regionRegex }],
-        }).select('citizenId').lean(),
-        User.find({ community: regionRegex }).select('_id').lean(),
-      ]);
-      const ids = new Set([
-        ...reporters.map(r => String(r.citizenId)),
-        ...communityUsers.map(u => String(u._id)),
-      ]);
-      if (ids.size === 0) {
-        return res.json({ success: false, error: `Aucun citoyen trouvé pour la région "${region}"` });
-      }
-      filter.userId = { $in: Array.from(ids).map(id => new mongoose.Types.ObjectId(id)) };
-    }
-
-    const tokens = await PushToken.find(filter);
-    
-    if (tokens.length === 0) {
-      return res.json({ success: false, error: 'Aucun token actif' });
-    }
-
-    const batchSize = 100;
-    let sent = 0;
-    
-    for (let i = 0; i < tokens.length; i += batchSize) {
-      const batch = tokens.slice(i, i + batchSize);
-      const messages = batch.map(token => ({
-        to: token.token,
-        sound: 'default',
-        title,
-        body,
-        data: { ...data, broadcast: true, timestamp: new Date().toISOString() },
-        priority: 'high',
-      }));
-
-      const response = await fetch('https://exp.host/--/api/v2/push/send', {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'Accept-Encoding': 'gzip, deflate',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(messages),
-      });
-      
-      const result = await response.json();
-      sent += result.data?.filter(r => r.status === 'ok').length || 0;
-      
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-    
-    console.log(`📢 Broadcast: "${title}" envoyé à ${sent}/${tokens.length} appareils`);
-    res.json({ 
-      success: true, 
-      message: `Broadcast envoyé à ${sent} appareil(s)`,
-      data: { sent, total: tokens.length }
+    // Log persistant
+    await NotificationLog.create({
+      title, body, target, targetValue: region || targetValue,
+      templateId, templateLabel,
+      sentBy: req.user?.id,
+      sent: result.sent, total: result.total,
+      status: 'sent', sentAt: new Date(),
     });
+
+    console.log(`📢 Broadcast: "${title}" envoyé à ${result.sent}/${result.total} appareils`);
+    res.json({ success: true, message: `Notification envoyée à ${result.sent} appareil(s)`, data: { sent: result.sent, total: result.total } });
 
   } catch (error) {
     console.error('❌ Erreur broadcast:', error);
@@ -1049,18 +1097,93 @@ app.post('/api/notifications/broadcast', requireAuth, requireAdmin, async (req, 
 // ── GET /api/notifications/stats — stats des tokens push (admin) ────────────
 app.get('/api/notifications/stats', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const [activeTokens, totalTokens, iosCount, androidCount] = await Promise.all([
+    const [activeTokens, totalTokens, iosCount, androidCount,
+           totalSent, sentThisWeek, scheduled] = await Promise.all([
       PushToken.countDocuments({ isActive: true }),
       PushToken.countDocuments({}),
       PushToken.countDocuments({ isActive: true, platform: 'ios' }),
       PushToken.countDocuments({ isActive: true, platform: 'android' }),
+      NotificationLog.countDocuments({ status: 'sent' }),
+      NotificationLog.countDocuments({ status: 'sent', sentAt: { $gte: new Date(Date.now() - 7 * 86400000) } }),
+      NotificationLog.countDocuments({ status: 'scheduled' }),
     ]);
+
+    // Stats par cible
+    const byTarget = await NotificationLog.aggregate([
+      { $match: { status: 'sent' } },
+      { $group: { _id: '$target', count: { $sum: 1 }, totalSent: { $sum: '$sent' } } },
+    ]);
+
     res.json({
       success: true,
-      data: { activeTokens, totalTokens, ios: iosCount, android: androidCount },
+      data: {
+        activeTokens, totalTokens, ios: iosCount, android: androidCount,
+        totalSent, sentThisWeek, scheduled,
+        byTarget: byTarget.reduce((acc, b) => { acc[b._id] = { count: b.count, sent: b.totalSent }; return acc; }, {}),
+      },
     });
   } catch (error) {
     console.error('❌ Erreur stats notifications:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── GET /api/notifications/history — historique persistant ──────────────────
+app.get('/api/notifications/history', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, status } = req.query;
+    const filter = status ? { status } : {};
+    const [logs, total] = await Promise.all([
+      NotificationLog.find(filter)
+        .sort({ createdAt: -1 })
+        .limit(Number(limit))
+        .skip((Number(page) - 1) * Number(limit))
+        .populate('sentBy', 'firstName lastName email')
+        .lean(),
+      NotificationLog.countDocuments(filter),
+    ]);
+    res.json({ success: true, data: { logs, total, page: Number(page), pages: Math.ceil(total / Number(limit)) } });
+  } catch (error) {
+    console.error('❌ Erreur historique notifications:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── POST /api/notifications/schedule — planifier une notification ────────────
+app.post('/api/notifications/schedule', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { title, body, scheduledAt, target = 'broadcast', targetValue = '', templateId = 'custom', templateLabel = 'Personnalisé' } = req.body;
+
+    if (!title || !body) return res.status(400).json({ success: false, error: 'Titre et message requis' });
+    if (!scheduledAt) return res.status(400).json({ success: false, error: 'Date de planification requise' });
+
+    const scheduledDate = new Date(scheduledAt);
+    if (scheduledDate <= new Date()) return res.status(400).json({ success: false, error: 'La date doit être dans le futur' });
+
+    const log = await NotificationLog.create({
+      title, body, target, targetValue, templateId, templateLabel,
+      sentBy: req.user?.id,
+      status: 'scheduled', scheduledAt: scheduledDate,
+    });
+
+    res.json({ success: true, message: `Notification planifiée pour le ${scheduledDate.toLocaleString('fr-FR')}`, data: log });
+  } catch (error) {
+    console.error('❌ Erreur planification notification:', error);
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── DELETE /api/notifications/schedule/:id — annuler une notification planifiée
+app.delete('/api/notifications/schedule/:id', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const log = await NotificationLog.findOneAndUpdate(
+      { _id: req.params.id, status: 'scheduled' },
+      { status: 'cancelled' },
+      { new: true }
+    );
+    if (!log) return res.status(404).json({ success: false, error: 'Notification planifiée non trouvée' });
+    res.json({ success: true, message: 'Notification annulée' });
+  } catch (error) {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
 });
