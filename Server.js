@@ -1326,13 +1326,47 @@ app.get('/api/reports', requireAuth, async (req, res) => {
 
 app.get('/api/reports/public', async (req, res) => {
   try {
-    const { limit = 30, sortBy = 'voteCount', sortOrder = 'desc' } = req.query;
+    const { limit = 30, sortBy = 'voteCount', sortOrder = 'desc', region = '' } = req.query;
     const sort = { [sortBy]: sortOrder === 'desc' ? -1 : 1 };
-    const reports = await Report.find({ status: { $ne: 'rejected' } })
+
+    const filter = { status: { $ne: 'rejected' } };
+    if (region && region !== 'all') {
+      const regionRegex = new RegExp(region, 'i');
+      filter.$or = [{ 'location.region': regionRegex }, { 'location.city': regionRegex }];
+    }
+
+    const reports = await Report.find(filter)
       .sort(sort).limit(parseInt(limit))
       .populate('citizen', 'firstName lastName community')
       .select('-processing.notes').lean();
-    res.json({ success: true, data: { reports, total: reports.length } });
+    res.json({ success: true, data: { reports, total: reports.length, region: region || 'all' } });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erreur serveur' });
+  }
+});
+
+// ── GET /api/reports/regions — liste des régions disponibles avec compteur ──
+app.get('/api/reports/regions', async (req, res) => {
+  try {
+    const cached = getCache('reports:regions');
+    if (cached) return res.json(cached);
+
+    const reports = await Report.find({ status: { $ne: 'rejected' } })
+      .select('location.region location.city').lean();
+
+    const counts = {};
+    reports.forEach(r => {
+      const zone = r.location?.region || r.location?.city;
+      if (zone) counts[zone] = (counts[zone] || 0) + 1;
+    });
+
+    const regions = Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, count]) => ({ name, count }));
+
+    const result = { success: true, data: { regions, total: reports.length } };
+    setCache('reports:regions', result, 5 * 60 * 1000); // 5 min
+    res.json(result);
   } catch (error) {
     res.status(500).json({ success: false, error: 'Erreur serveur' });
   }
